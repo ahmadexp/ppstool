@@ -12,6 +12,7 @@ TARGET := ppstool
 GUI := ppstool-gui.py
 GUI_APP := ppstool-gui.pyz
 ZIPAPP_DIR := .ppstool-gui-zipapp
+ZIPAPP_EMBED_CLI ?= 1
 
 .PHONY: all check clean gui install install-gui uninstall zipapp
 
@@ -25,10 +26,15 @@ gui:
 
 zipapp: $(GUI_APP)
 
+ifeq ($(ZIPAPP_EMBED_CLI),1)
+$(GUI_APP): $(TARGET)
+endif
+
 $(GUI_APP): $(GUI)
 	rm -rf $(ZIPAPP_DIR)
 	mkdir -p $(ZIPAPP_DIR)
 	cp $(GUI) $(ZIPAPP_DIR)/__main__.py
+	if [ "$(ZIPAPP_EMBED_CLI)" = "1" ]; then cp $(TARGET) $(ZIPAPP_DIR)/$(TARGET); fi
 	python3 -m zipapp $(ZIPAPP_DIR) --python "/usr/bin/env python3" --output $@
 	chmod 0755 $@
 	rm -rf $(ZIPAPP_DIR)

@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
-"""Menu-driven Tkinter frontend for the ppstool command line utility."""
+"""Menu-driven text frontend for the ppstool command line utility."""
 
 from __future__ import annotations
 
 import glob
+import hashlib
+import os
 from pathlib import Path
 import queue
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
+import zipfile
 
+TK_AVAILABLE = False
 try:
     import tkinter as tk
     from tkinter import messagebox, ttk
     from tkinter.scrolledtext import ScrolledText
-except ModuleNotFoundError as exc:
-    if exc.name and exc.name.startswith("tkinter"):
-        print(
-            "ppstool-gui requires Python Tkinter, but this Python cannot import tkinter.",
-            file=sys.stderr,
-        )
-        print("Install the Tkinter package for the Python used to run ppstool-gui.", file=sys.stderr)
-        print("Debian/Ubuntu: sudo apt install python3-tk", file=sys.stderr)
-        print("Fedora/RHEL:   sudo dnf install python3-tkinter", file=sys.stderr)
-        print("Arch:         sudo pacman -S tk", file=sys.stderr)
-        raise SystemExit(1) from None
-    raise
+    TK_AVAILABLE = True
+except ModuleNotFoundError:
+    class _MissingTk:
+        Tk = object
+
+    tk = _MissingTk()
+    messagebox = None
+    ttk = None
+    ScrolledText = None
 
 
 DEFAULT_DEVICE = "/dev/ptp0"
@@ -57,7 +59,55 @@ MENU_ITEMS = [
 ]
 
 
+def running_zipapp() -> Optional[Path]:
+    argv_path = Path(sys.argv[0])
+    if argv_path.exists() and zipfile.is_zipfile(argv_path):
+        return argv_path.resolve()
+    return None
+
+
+def cache_root() -> Path:
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        return Path(xdg_cache) / "ppstool"
+    return Path.home() / ".cache" / "ppstool"
+
+
+def bundled_command() -> Optional[str]:
+    archive = running_zipapp()
+    if archive is None:
+        return None
+
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            data = bundle.read("ppstool")
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return None
+
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    target_dir = cache_root() / digest
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "ppstool"
+        if not target.exists() or target.read_bytes() != data:
+            target.write_bytes(data)
+            target.chmod(0o755)
+        return str(target)
+    except OSError:
+        target_dir = Path(tempfile.gettempdir()) / "ppstool" / digest
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "ppstool"
+        if not target.exists() or target.read_bytes() != data:
+            target.write_bytes(data)
+            target.chmod(0o755)
+        return str(target)
+
+
 def default_command() -> str:
+    bundled = bundled_command()
+    if bundled:
+        return bundled
+
     candidates = [
         Path(sys.argv[0]).resolve().with_name("ppstool"),
         Path(__file__).resolve().with_name("ppstool"),
@@ -75,6 +125,27 @@ def ptp_devices() -> List[str]:
 
 def command_to_text(command: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
+
+
+def parse_int(value: str, name: str, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value, 0)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return parsed
+
+
+def build_base_command(command_text: str, device: str) -> List[str]:
+    command_text = command_text.strip()
+    if not command_text:
+        raise ValueError("Command is required")
+    command = shlex.split(command_text)
+    device = device.strip()
+    if device:
+        command.extend(["-d", device])
+    return command
 
 
 class PpsToolGui(tk.Tk):
@@ -720,10 +791,335 @@ class PpsToolGui(tk.Tk):
         self.run(args)
 
 
+class TextPpsToolUi:
+    def __init__(self) -> None:
+        self.command_text = default_command()
+        self.device = ptp_devices()[0]
+        self.channel = 0
+        self.pin = 0
+
+    def run(self) -> int:
+        print("ppstool text UI")
+        print("Press Ctrl-C while a command is running to stop it.\n")
+        while True:
+            try:
+                choice = self.choose(
+                    "Main menu",
+                    [
+                        ("Common setup", self.common_setup),
+                        ("Status", self.status),
+                        ("PPS input", self.pps_input),
+                        ("PPS output", self.pps_output),
+                        ("Pins", self.pins),
+                        ("Time", self.time),
+                        ("Advanced", self.advanced),
+                        ("Settings", self.settings),
+                    ],
+                )
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if choice == "quit":
+                return 0
+
+    def choose(self, title: str, items: List[Tuple[str, Callable[[], None]]]) -> str:
+        while True:
+            print(f"\n== {title} ==")
+            print(f"Command: {self.command_text}")
+            print(f"Device:  {self.device}    Pin: {self.pin}    Channel: {self.channel}")
+            for index, (label, _) in enumerate(items, start=1):
+                print(f"{index}. {label}")
+            print("q. Back" if title != "Main menu" else "q. Quit")
+            choice = input("> ").strip().lower()
+            if choice in {"q", "quit", "b", "back"}:
+                return "quit" if title == "Main menu" else "back"
+            if not choice:
+                continue
+            try:
+                label, action = items[int(choice) - 1]
+            except (ValueError, IndexError):
+                print("Invalid selection")
+                continue
+            print(f"\n-- {label} --")
+            try:
+                action()
+            except ValueError as exc:
+                print(f"Error: {exc}")
+            input("\nPress Enter to continue...")
+
+    def prompt(self, label: str, current: str = "") -> str:
+        suffix = f" [{current}]" if current != "" else ""
+        value = input(f"{label}{suffix}: ").strip()
+        return current if value == "" else value
+
+    def prompt_int(self, label: str, current: int, minimum: int, maximum: int) -> int:
+        value = self.prompt(label, str(current))
+        return parse_int(value, label, minimum, maximum)
+
+    def base_command(self) -> List[str]:
+        return build_base_command(self.command_text, self.device)
+
+    def run_command(self, args: List[str]) -> None:
+        command = self.base_command() + args
+        print(f"$ {command_to_text(command)}")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            print(f"Command not found: {command[0]}")
+            return
+        except OSError as exc:
+            print(exc)
+            return
+
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="")
+            return_code = process.wait()
+        except KeyboardInterrupt:
+            print("\n[terminating]")
+            process.terminate()
+            try:
+                return_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait()
+        print(f"\n[exit {return_code}]")
+
+    def run_with_index(self, args: List[str]) -> None:
+        self.run_command(["-i", str(self.channel)] + args)
+
+    def common_setup(self) -> None:
+        self.choose(
+            "Common setup",
+            [
+                ("Inspect device", lambda: self.run_command(["-c", "-l"])),
+                ("Configure PPS input", self.configure_pps_input),
+                ("Configure 1 Hz PPS output", self.configure_one_hz_output),
+                ("Read PPS input until stopped", lambda: self.run_with_index(["-e", "-1"])),
+                ("Enable system PPS", lambda: self.run_command(["-P", "1"])),
+                ("Disable periodic output", self.disable_perout),
+            ],
+        )
+
+    def status(self) -> None:
+        self.choose(
+            "Status",
+            [
+                ("Capabilities", lambda: self.run_command(["-c"])),
+                ("Pin configuration", lambda: self.run_command(["-l"])),
+                ("Clock time", lambda: self.run_command(["-g"])),
+                ("Cross timestamp", lambda: self.run_command(["-X"])),
+                ("Measure offset", self.measure_offset),
+                ("Read extended time", self.read_extended),
+            ],
+        )
+
+    def pps_input(self) -> None:
+        self.choose(
+            "PPS input",
+            [
+                ("Set pin as input", self.configure_pps_input),
+                ("Read events", self.read_events),
+                ("Read until stopped", lambda: self.run_with_index(["-e", "-1"])),
+            ],
+        )
+
+    def pps_output(self) -> None:
+        self.choose(
+            "PPS output",
+            [
+                ("Set pin as output", self.configure_pps_output_pin),
+                ("Apply output", self.enable_perout),
+                ("Set pin and apply", lambda: self.enable_perout(configure_pin=True)),
+                ("Disable output", self.disable_perout),
+            ],
+        )
+
+    def pins(self) -> None:
+        self.choose(
+            "Pins",
+            [
+                ("Apply pin function", self.set_pin_function),
+                ("List pins", lambda: self.run_command(["-l"])),
+            ],
+        )
+
+    def time(self) -> None:
+        self.choose(
+            "Time",
+            [
+                ("Get PTP clock time", lambda: self.run_command(["-g"])),
+                ("Set PTP from system time", lambda: self.run_command(["-s"])),
+                ("Set system from PTP time", lambda: self.run_command(["-S"])),
+                ("Apply frequency adjustment", self.adjust_frequency),
+                ("Shift PTP time", self.shift_time),
+                ("Apply phase offset", self.adjust_phase),
+                ("Set PTP to seconds", self.set_time_seconds),
+            ],
+        )
+
+    def advanced(self) -> None:
+        self.choose(
+            "Advanced",
+            [
+                ("Flag test", lambda: self.run_with_index(["-z"])),
+                ("Enable system PPS", lambda: self.run_command(["-P", "1"])),
+                ("Disable system PPS", lambda: self.run_command(["-P", "0"])),
+                ("Enable single mask channel", self.enable_mask_channel),
+                ("Run raw args", self.run_raw_args),
+            ],
+        )
+
+    def settings(self) -> None:
+        while True:
+            print("\n== Settings ==")
+            print(f"1. Command: {self.command_text}")
+            print(f"2. Device:  {self.device}")
+            print(f"3. Pin:     {self.pin}")
+            print(f"4. Channel: {self.channel}")
+            print("q. Back")
+            choice = input("> ").strip().lower()
+            if choice in {"q", "quit", "b", "back"}:
+                return
+            if choice == "1":
+                self.command_text = self.prompt("Command", self.command_text)
+            elif choice == "2":
+                self.select_device()
+            elif choice == "3":
+                self.pin = self.prompt_int("Pin", self.pin, 0, MAX_UI_INDEX)
+            elif choice == "4":
+                self.channel = self.prompt_int("Channel", self.channel, 0, MAX_UI_INDEX)
+            else:
+                print("Invalid selection")
+
+    def select_device(self) -> None:
+        devices = ptp_devices()
+        print("\nAvailable devices:")
+        for index, device in enumerate(devices, start=1):
+            print(f"{index}. {device}")
+        print("Or enter a device path.")
+        value = self.prompt("Device", self.device)
+        try:
+            self.device = devices[int(value) - 1]
+        except (ValueError, IndexError):
+            self.device = value
+
+    def measure_offset(self) -> None:
+        samples = self.prompt_int("Samples", 5, 1, MAX_SAMPLES)
+        self.run_command(["-k", str(samples)])
+
+    def read_extended(self) -> None:
+        samples = self.prompt_int("Samples", 5, 1, MAX_SAMPLES)
+        self.run_command(["-x", str(samples)])
+
+    def configure_pps_input(self) -> None:
+        self.run_command(["-i", str(self.channel), "-L", f"{self.pin},{PIN_FUNCTIONS['External timestamp']}"])
+
+    def configure_pps_output_pin(self) -> None:
+        self.run_command(["-i", str(self.channel), "-L", f"{self.pin},{PIN_FUNCTIONS['Periodic output']}"])
+
+    def configure_one_hz_output(self) -> None:
+        self.enable_perout(configure_pin=True, preset_period=PERIOD_PRESETS["1 Hz"])
+
+    def set_pin_function(self) -> None:
+        names = list(PIN_FUNCTIONS.keys())
+        for index, name in enumerate(names, start=1):
+            print(f"{index}. {name}")
+        value = self.prompt("Function", "External timestamp")
+        try:
+            function_name = names[int(value) - 1]
+        except (ValueError, IndexError):
+            function_name = value
+        if function_name not in PIN_FUNCTIONS:
+            raise ValueError("Function must be one of: " + ", ".join(names))
+        self.run_command(["-i", str(self.channel), "-L", f"{self.pin},{PIN_FUNCTIONS[function_name]}"])
+
+    def enable_perout(self, configure_pin: bool = False, preset_period: str = "") -> None:
+        if preset_period:
+            period = parse_int(preset_period, "Period", 0, 2**63 - 1)
+        else:
+            period = self.prompt_period()
+        width_text = self.prompt("Pulse width ns (optional)", "")
+        phase_text = self.prompt("Phase ns (optional)", "")
+
+        args = ["-i", str(self.channel)]
+        if configure_pin:
+            args.extend(["-L", f"{self.pin},{PIN_FUNCTIONS['Periodic output']}"])
+        args.extend(["-p", str(period)])
+        if width_text:
+            args.extend(["-w", str(parse_int(width_text, "Pulse width", 0, 2**63 - 1))])
+        if phase_text:
+            args.extend(["-H", str(parse_int(phase_text, "Phase", 0, 2**63 - 1))])
+        self.run_command(args)
+
+    def prompt_period(self) -> int:
+        presets = list(PERIOD_PRESETS.items())
+        for index, (label, value) in enumerate(presets, start=1):
+            suffix = f" ({value} ns)" if value else ""
+            print(f"{index}. {label}{suffix}")
+        value = self.prompt("Preset or period ns", "1")
+        try:
+            _, period = presets[int(value) - 1]
+        except (ValueError, IndexError):
+            period = value
+        if not period:
+            period = self.prompt("Period ns", PERIOD_PRESETS["1 Hz"])
+        return parse_int(period, "Period", 0, 2**63 - 1)
+
+    def disable_perout(self) -> None:
+        self.run_command(["-i", str(self.channel), "-p", "0"])
+
+    def read_events(self) -> None:
+        count = self.prompt_int("Event count (-1 until stopped)", 1, -1, 1000000)
+        self.run_with_index(["-e", str(count)])
+
+    def adjust_frequency(self) -> None:
+        value = self.prompt_int("Frequency adjustment ppb", 0, -(2**31), 2**31 - 1)
+        self.run_command(["-f", str(value)])
+
+    def shift_time(self) -> None:
+        seconds = self.prompt_int("Shift seconds", 0, -(2**31), 2**31 - 1)
+        nanoseconds = self.prompt_int("Shift nanoseconds", 0, -(2**31), 2**31 - 1)
+        self.run_command(["-t", str(seconds), "-n", str(nanoseconds)])
+
+    def adjust_phase(self) -> None:
+        value = self.prompt_int("Phase offset ns", 0, -(2**31), 2**31 - 1)
+        self.run_command(["-o", str(value)])
+
+    def set_time_seconds(self) -> None:
+        value = self.prompt_int("PTP seconds", 0, 0, 2**31 - 1)
+        self.run_command(["-T", str(value)])
+
+    def enable_mask_channel(self) -> None:
+        value = self.prompt_int("Mask channel", 0, 0, MAX_UI_INDEX)
+        self.run_command(["-F", str(value)])
+
+    def run_raw_args(self) -> None:
+        raw_args = self.prompt("Raw args")
+        if not raw_args:
+            raise ValueError("Raw args are required")
+        self.run_command(shlex.split(raw_args))
+
+
 def main() -> int:
-    app = PpsToolGui()
-    app.mainloop()
-    return 0
+    if "--tk" in sys.argv:
+        if not TK_AVAILABLE:
+            print("Tkinter is not available for this Python.", file=sys.stderr)
+            print("Run without --tk for the self-contained text UI.", file=sys.stderr)
+            return 1
+        app = PpsToolGui()
+        app.mainloop()
+        return 0
+    return TextPpsToolUi().run()
 
 
 if __name__ == "__main__":

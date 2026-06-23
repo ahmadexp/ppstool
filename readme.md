@@ -7,18 +7,20 @@ periodic output, pin configuration, PHC time reads, and offset measurements.
 The project now includes:
 
 - `ppstool`: the command line tool, with stricter argument validation.
-- `ppstool-gui.py`: an optional Tkinter desktop frontend that runs the same CLI.
+- `ppstool-gui.py`: a text-based menu UI that runs the same CLI.
 
 ## Requirements
 
 - Linux with PTP clock support.
 - C compiler, `make`, libc development headers, and Linux UAPI headers.
-- Optional GUI: Python 3 with Tkinter, usually packaged as `python3-tk`.
+- Optional UI: Python 3.
+- Optional Tk desktop mode: Python 3 with Tkinter, usually packaged as
+  `python3-tk`.
 
 On Debian/Ubuntu-style systems:
 
 ```sh
-sudo apt install build-essential linux-libc-dev python3-tk
+sudo apt install build-essential linux-libc-dev python3
 ```
 
 ## Build
@@ -34,22 +36,27 @@ The default linker flags keep `-lrt` for older systems. On modern systems where
 make LDLIBS=
 ```
 
-Check the optional GUI syntax without building the C tool:
+Check the optional UI syntax without building the C tool:
 
 ```sh
 make gui
 ```
 
-Build the optional GUI as a Python zipapp:
+Build the text UI as a self-contained Python zipapp:
 
 ```sh
 make zipapp
 ./ppstool-gui.pyz
 ```
 
-The zipapp still uses the host Python runtime, so Tkinter must be installed for
-that Python. If `./ppstool-gui.pyz` reports that it cannot import `tkinter`,
-install the platform Tkinter package such as `python3-tk`.
+By default, `make zipapp` embeds the compiled `ppstool` binary in the archive,
+so the resulting `.pyz` only needs a compatible Linux system and Python 3 to
+launch. To build a UI-only archive that expects `ppstool` beside the archive or
+in `PATH`, run:
+
+```sh
+make ZIPAPP_EMBED_CLI=0 zipapp
+```
 
 ## Install
 
@@ -59,13 +66,13 @@ Install the CLI:
 sudo make install
 ```
 
-Install both the CLI and GUI:
+Install both the CLI and text UI:
 
 ```sh
 sudo make install-gui
 ```
 
-The GUI is installed from the generated zipapp as `ppstool-gui`.
+The UI is installed from the generated zipapp as `ppstool-gui`.
 
 The default prefix is `/usr/local`. Override it when needed:
 
@@ -73,7 +80,7 @@ The default prefix is `/usr/local`. Override it when needed:
 sudo make PREFIX=/usr install-gui
 ```
 
-## GUI
+## Text UI
 
 From the source checkout:
 
@@ -87,15 +94,22 @@ After `sudo make install-gui`:
 ppstool-gui
 ```
 
-The GUI command field defaults to a local `./ppstool` binary when one exists,
-otherwise it uses `ppstool` from `PATH`. Some operations require elevated
-permissions; run the GUI with suitable privileges or set the command field to a
-privilege helper such as `pkexec /path/to/ppstool`.
+The text UI defaults to an embedded `ppstool` binary when one exists in the
+zipapp, then to a local `./ppstool` binary when one exists, otherwise to
+`ppstool` from `PATH`. Some operations require elevated permissions; run the UI
+with suitable privileges or set the command field to a privilege helper such as
+`pkexec /path/to/ppstool`.
 
-The GUI uses a menu-driven layout for common workflows: device status, PPS
+The UI uses a menu-driven layout for common workflows: device status, PPS
 input, PPS output, pin functions, clock/time adjustment, and advanced raw
 arguments. The common setup screen includes quick actions for PPS input capture,
 1 Hz PPS output, system PPS, and periodic output disable.
+
+If Tkinter is installed and you prefer the old desktop window, run:
+
+```sh
+./ppstool-gui.py --tk
+```
 
 ## Common CLI Examples
 
