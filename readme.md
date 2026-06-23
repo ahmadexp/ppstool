@@ -7,15 +7,13 @@ periodic output, pin configuration, PHC time reads, and offset measurements.
 The project now includes:
 
 - `ppstool`: the command line tool, with stricter argument validation.
-- `ppstool-gui.py`: a text-based menu UI that runs the same CLI.
+- `ppstool-gui.py`: a curses terminal UI that runs the same CLI.
 
 ## Requirements
 
 - Linux with PTP clock support.
 - C compiler, `make`, libc development headers, and Linux UAPI headers.
-- Optional UI: Python 3.
-- Optional Tk desktop mode: Python 3 with Tkinter, usually packaged as
-  `python3-tk`.
+- Terminal UI: Python 3 with curses support.
 
 On Debian/Ubuntu-style systems:
 
@@ -36,13 +34,13 @@ The default linker flags keep `-lrt` for older systems. On modern systems where
 make LDLIBS=
 ```
 
-Check the optional UI syntax without building the C tool:
+Check the terminal UI syntax without building the C tool:
 
 ```sh
-make gui
+make ui
 ```
 
-Build the text UI as a self-contained Python zipapp:
+Build the terminal UI as a self-contained Python zipapp:
 
 ```sh
 make zipapp
@@ -66,10 +64,10 @@ Install the CLI:
 sudo make install
 ```
 
-Install both the CLI and text UI:
+Install both the CLI and terminal UI:
 
 ```sh
-sudo make install-gui
+sudo make install-ui
 ```
 
 The UI is installed from the generated zipapp as `ppstool-gui`.
@@ -77,10 +75,10 @@ The UI is installed from the generated zipapp as `ppstool-gui`.
 The default prefix is `/usr/local`. Override it when needed:
 
 ```sh
-sudo make PREFIX=/usr install-gui
+sudo make PREFIX=/usr install-ui
 ```
 
-## Text UI
+## Terminal UI
 
 From the source checkout:
 
@@ -88,28 +86,22 @@ From the source checkout:
 ./ppstool-gui.py
 ```
 
-After `sudo make install-gui`:
+After `sudo make install-ui`:
 
 ```sh
 ppstool-gui
 ```
 
-The text UI defaults to an embedded `ppstool` binary when one exists in the
+The terminal UI defaults to an embedded `ppstool` binary when one exists in the
 zipapp, then to a local `./ppstool` binary when one exists, otherwise to
 `ppstool` from `PATH`. Some operations require elevated permissions; run the UI
 with suitable privileges or set the command field to a privilege helper such as
 `pkexec /path/to/ppstool`.
 
-The UI uses a menu-driven layout for common workflows: device status, PPS
-input, PPS output, pin functions, clock/time adjustment, and advanced raw
-arguments. The common setup screen includes quick actions for PPS input capture,
-1 Hz PPS output, system PPS, and periodic output disable.
-
-If Tkinter is installed and you prefer the old desktop window, run:
-
-```sh
-./ppstool-gui.py --tk
-```
+The UI uses a curses layout with section navigation, action selection, editable
+settings, and a live output pane. Use arrow keys or `hjkl` to move, Enter to
+run or edit, `s` for settings, `x` to stop a running command, `c` to clear
+output, and `q` to quit.
 
 ## Common CLI Examples
 

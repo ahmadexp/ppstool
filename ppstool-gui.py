@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Menu-driven text frontend for the ppstool command line utility."""
+"""Terminal UI for the ppstool command line utility."""
 
 from __future__ import annotations
 
@@ -13,28 +13,19 @@ import subprocess
 import sys
 import tempfile
 import threading
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple
 import zipfile
 
-TK_AVAILABLE = False
 try:
-    import tkinter as tk
-    from tkinter import messagebox, ttk
-    from tkinter.scrolledtext import ScrolledText
-    TK_AVAILABLE = True
+    import curses
 except ModuleNotFoundError:
-    class _MissingTk:
-        Tk = object
-
-    tk = _MissingTk()
-    messagebox = None
-    ttk = None
-    ScrolledText = None
+    curses = None
 
 
 DEFAULT_DEVICE = "/dev/ptp0"
 MAX_SAMPLES = 25
 MAX_UI_INDEX = 1024
+MAX_OUTPUT_LINES = 1000
 PIN_FUNCTIONS = {
     "None": 0,
     "External timestamp": 1,
@@ -48,15 +39,6 @@ PERIOD_PRESETS = {
     "1 kHz": "1000000",
     "Custom": "",
 }
-MENU_ITEMS = [
-    ("home", "Common setup"),
-    ("status", "Status"),
-    ("pps_input", "PPS input"),
-    ("pps_output", "PPS output"),
-    ("pins", "Pins"),
-    ("time", "Time"),
-    ("advanced", "Advanced"),
-]
 
 
 def running_zipapp() -> Optional[Path]:
@@ -85,22 +67,18 @@ def bundled_command() -> Optional[str]:
         return None
 
     digest = hashlib.sha256(data).hexdigest()[:16]
-    target_dir = cache_root() / digest
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / "ppstool"
-        if not target.exists() or target.read_bytes() != data:
-            target.write_bytes(data)
-            target.chmod(0o755)
-        return str(target)
-    except OSError:
-        target_dir = Path(tempfile.gettempdir()) / "ppstool" / digest
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / "ppstool"
-        if not target.exists() or target.read_bytes() != data:
-            target.write_bytes(data)
-            target.chmod(0o755)
-        return str(target)
+    for base_dir in (cache_root(), Path(tempfile.gettempdir()) / "ppstool"):
+        target_dir = base_dir / digest
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / "ppstool"
+            if not target.exists() or target.read_bytes() != data:
+                target.write_bytes(data)
+                target.chmod(0o755)
+            return str(target)
+        except OSError:
+            continue
+    return None
 
 
 def default_command() -> str:
@@ -148,456 +126,244 @@ def build_base_command(command_text: str, device: str) -> List[str]:
     return command
 
 
-class PpsToolGui(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("ppstool")
-        self.geometry("1120x760")
-        self.minsize(920, 620)
+Action = Tuple[str, Callable[[], None]]
+Section = Tuple[str, Callable[[], List[Action]]]
 
-        self.output_queue: "queue.Queue[Tuple[str, Optional[Union[str, int]]]]" = queue.Queue()
+
+class PpsToolTui:
+    def __init__(self, stdscr: "curses.window") -> None:
+        self.stdscr = stdscr
+        self.command_text = default_command()
+        self.device = ptp_devices()[0]
+        self.channel = 0
+        self.pin = 0
+        self.section_index = 0
+        self.action_index = 0
+        self.status = "Ready"
+        self.output_lines = [""]
+        self.output_scroll = 0
+        self.output_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         self.current_process: Optional[subprocess.Popen] = None
-        self.pages = {}
+        self.sections: List[Section] = [
+            ("Common", self.common_actions),
+            ("Status", self.status_actions),
+            ("PPS In", self.pps_input_actions),
+            ("PPS Out", self.pps_output_actions),
+            ("Pins", self.pin_actions),
+            ("Time", self.time_actions),
+            ("Advanced", self.advanced_actions),
+            ("Settings", self.settings_actions),
+        ]
 
-        self.command_var = tk.StringVar(value=default_command())
-        self.device_var = tk.StringVar(value=ptp_devices()[0])
-        self.index_var = tk.StringVar(value="0")
-        self.offset_samples_var = tk.StringVar(value="5")
-        self.extended_samples_var = tk.StringVar(value="5")
-        self.event_count_var = tk.StringVar(value="1")
-        self.pin_index_var = tk.StringVar(value="0")
-        self.pin_function_var = tk.StringVar(value="External timestamp")
-        self.period_preset_var = tk.StringVar(value="1 Hz")
-        self.perout_period_var = tk.StringVar(value=PERIOD_PRESETS["1 Hz"])
-        self.perout_width_var = tk.StringVar(value="")
-        self.perout_phase_var = tk.StringVar(value="")
-        self.freq_adjust_var = tk.StringVar(value="0")
-        self.shift_seconds_var = tk.StringVar(value="0")
-        self.shift_ns_var = tk.StringVar(value="0")
-        self.phase_offset_var = tk.StringVar(value="0")
-        self.set_seconds_var = tk.StringVar(value="0")
-        self.mask_channel_var = tk.StringVar(value="0")
-        self.raw_args_var = tk.StringVar(value="")
-        self.page_title_var = tk.StringVar(value="")
+    def run(self) -> int:
+        self.configure_screen()
+        while True:
+            self.drain_output()
+            self.draw()
+            key = self.stdscr.getch()
+            if key == -1:
+                continue
+            if self.handle_key(key):
+                return 0
 
-        self._build_ui()
-        self.show_page("home")
-        self.after(100, self._drain_output)
+    def configure_screen(self) -> None:
+        curses.curs_set(0)
+        curses.use_default_colors()
+        self.stdscr.keypad(True)
+        self.stdscr.timeout(100)
+        if curses.has_colors():
+            curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(2, curses.COLOR_CYAN, -1)
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)
+            curses.init_pair(4, curses.COLOR_GREEN, -1)
+            curses.init_pair(5, curses.COLOR_RED, -1)
 
-    def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+    def color(self, pair: int) -> int:
+        if curses.has_colors():
+            return curses.color_pair(pair)
+        return 0
 
-        self._build_header(self)
+    def handle_key(self, key: int) -> bool:
+        if key in (ord("q"), ord("Q")):
+            self.stop_command()
+            return True
+        if key in (curses.KEY_LEFT, ord("h")):
+            self.move_section(-1)
+        elif key in (curses.KEY_RIGHT, ord("l"), ord("\t")):
+            self.move_section(1)
+        elif key in (curses.KEY_UP, ord("k")):
+            self.move_action(-1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.move_action(1)
+        elif key in (curses.KEY_NPAGE,):
+            self.output_scroll = max(0, self.output_scroll - 8)
+        elif key in (curses.KEY_PPAGE,):
+            self.output_scroll += 8
+        elif key in (ord("c"), ord("C")):
+            self.output_lines = [""]
+            self.output_scroll = 0
+        elif key in (ord("x"), ord("X")):
+            self.stop_command()
+        elif key in (ord("s"), ord("S")):
+            self.section_index = len(self.sections) - 1
+            self.action_index = 0
+        elif key in (curses.KEY_ENTER, 10, 13):
+            self.invoke_selected()
+        return False
 
-        body = ttk.PanedWindow(self, orient="horizontal")
-        body.grid(row=1, column=0, sticky="nsew")
+    def move_section(self, delta: int) -> None:
+        self.section_index = (self.section_index + delta) % len(self.sections)
+        self.action_index = 0
 
-        nav = ttk.Frame(body, padding=(12, 10, 6, 12), width=210)
-        main = ttk.PanedWindow(body, orient="vertical")
-        body.add(nav, weight=0)
-        body.add(main, weight=1)
+    def move_action(self, delta: int) -> None:
+        actions = self.current_actions()
+        if actions:
+            self.action_index = (self.action_index + delta) % len(actions)
 
-        self._build_navigation(nav)
+    def current_actions(self) -> List[Action]:
+        return self.sections[self.section_index][1]()
 
-        page_shell = ttk.Frame(main, padding=(6, 10, 12, 6))
-        output_shell = ttk.Frame(main, padding=(6, 6, 12, 12))
-        main.add(page_shell, weight=3)
-        main.add(output_shell, weight=2)
-
-        page_shell.columnconfigure(0, weight=1)
-        page_shell.rowconfigure(1, weight=1)
-        ttk.Label(page_shell, textvariable=self.page_title_var, font=("TkDefaultFont", 16, "bold")).grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
-        )
-        self.page_area = ttk.Frame(page_shell)
-        self.page_area.grid(row=1, column=0, sticky="nsew")
-        self.page_area.columnconfigure(0, weight=1)
-        self.page_area.rowconfigure(0, weight=1)
-        self._build_pages(self.page_area)
-        self._build_output(output_shell)
-
-    def _build_header(self, parent: tk.Misc) -> None:
-        top = ttk.Frame(parent, padding=(12, 12, 12, 8))
-        top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(1, weight=1)
-
-        ttk.Label(top, text="Command").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(top, textvariable=self.command_var).grid(row=0, column=1, sticky="ew")
-        ttk.Label(top, text="Device").grid(row=0, column=2, sticky="w", padx=(12, 6))
-        self.device_box = ttk.Combobox(top, textvariable=self.device_var, values=ptp_devices(), width=18)
-        self.device_box.grid(row=0, column=3, sticky="ew")
-        ttk.Button(top, text="Refresh", command=self.refresh_devices).grid(row=0, column=4, padx=(6, 0))
-        self.stop_button = ttk.Button(top, text="Stop", command=self.stop_command, state="disabled")
-        self.stop_button.grid(row=0, column=5, padx=(6, 0))
-
-    def _build_navigation(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(1, weight=1)
-        parent.columnconfigure(0, weight=1)
-
-        ttk.Label(parent, text="Menu", font=("TkDefaultFont", 14, "bold")).grid(row=0, column=0, sticky="w")
-        self.nav_list = tk.Listbox(parent, exportselection=False, height=len(MENU_ITEMS), activestyle="dotbox")
-        self.nav_list.grid(row=1, column=0, sticky="nsew", pady=(8, 10))
-        for _, title in MENU_ITEMS:
-            self.nav_list.insert("end", title)
-        self.nav_list.bind("<<ListboxSelect>>", self._on_menu_select)
-        self.nav_list.bind("<Return>", self._on_menu_select)
-        self.nav_list.bind("<Double-Button-1>", self._on_menu_select)
-
-        ttk.Button(parent, text="Quit", command=self.destroy).grid(row=2, column=0, sticky="ew")
-
-    def _build_pages(self, parent: ttk.Frame) -> None:
-        builders = {
-            "home": self._build_home_page,
-            "status": self._build_status_page,
-            "pps_input": self._build_pps_input_page,
-            "pps_output": self._build_pps_output_page,
-            "pins": self._build_pins_page,
-            "time": self._build_time_page,
-            "advanced": self._build_advanced_page,
-        }
-        for name, _ in MENU_ITEMS:
-            page = ttk.Frame(parent)
-            page.grid(row=0, column=0, sticky="nsew")
-            page.columnconfigure(0, weight=1)
-            builders[name](page)
-            self.pages[name] = page
-
-    def _build_output(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(1, weight=1)
-        parent.columnconfigure(0, weight=1)
-        bar = ttk.Frame(parent)
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        bar.columnconfigure(0, weight=1)
-        ttk.Label(bar, text="Output", font=("TkDefaultFont", 13, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Button(bar, text="Clear", command=self.clear_output).grid(row=0, column=1, sticky="e")
-        self.output = ScrolledText(parent, wrap="word", height=12, font=("Menlo", 12))
-        self.output.grid(row=1, column=0, sticky="nsew")
-
-    def _on_menu_select(self, _event: tk.Event) -> None:
-        selection = self.nav_list.curselection()
-        if selection:
-            self.show_page(MENU_ITEMS[selection[0]][0])
-
-    def show_page(self, name: str) -> None:
-        page = self.pages[name]
-        page.tkraise()
-        for index, (page_name, title) in enumerate(MENU_ITEMS):
-            if page_name == name:
-                self.page_title_var.set(title)
-                self.nav_list.selection_clear(0, "end")
-                self.nav_list.selection_set(index)
-                self.nav_list.activate(index)
-                break
-
-    def _build_home_page(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.grid(row=0, column=0, sticky="new")
-        for column in range(3):
-            panel.columnconfigure(column, weight=1)
-
-        self._build_context_fields(panel, row=0, columnspan=3)
-
-        ttk.Button(panel, text="Inspect device", command=lambda: self.run(["-c", "-l"])).grid(
-            row=1, column=0, sticky="ew", padx=(0, 8), pady=(12, 8)
-        )
-        ttk.Button(panel, text="Configure PPS input", command=self.configure_pps_input).grid(
-            row=1, column=1, sticky="ew", padx=(0, 8), pady=(12, 8)
-        )
-        ttk.Button(panel, text="Configure 1 Hz PPS output", command=self.configure_one_hz_output).grid(
-            row=1, column=2, sticky="ew", pady=(12, 8)
-        )
-        ttk.Button(panel, text="Read PPS input until stopped", command=lambda: self.run_with_index(["-e", "-1"])).grid(
-            row=2, column=0, sticky="ew", padx=(0, 8)
-        )
-        ttk.Button(panel, text="Enable system PPS", command=lambda: self.run(["-P", "1"])).grid(
-            row=2, column=1, sticky="ew", padx=(0, 8)
-        )
-        ttk.Button(panel, text="Disable periodic output", command=self.disable_perout).grid(
-            row=2, column=2, sticky="ew"
-        )
-
-    def _build_status_page(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.grid(row=0, column=0, sticky="new")
-        for column in range(2):
-            panel.columnconfigure(column, weight=1)
-
-        ttk.Button(panel, text="Capabilities", command=lambda: self.run(["-c"])).grid(
-            row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8)
-        )
-        ttk.Button(panel, text="Pin configuration", command=lambda: self.run(["-l"])).grid(
-            row=0, column=1, sticky="ew", pady=(0, 8)
-        )
-        ttk.Button(panel, text="Clock time", command=lambda: self.run(["-g"])).grid(
-            row=1, column=0, sticky="ew", padx=(0, 8), pady=(0, 8)
-        )
-        ttk.Button(panel, text="Cross timestamp", command=lambda: self.run(["-X"])).grid(
-            row=1, column=1, sticky="ew", pady=(0, 8)
-        )
-
-        sample_box = ttk.Labelframe(panel, text="Offset measurement", padding=10)
-        sample_box.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        sample_box.columnconfigure(1, weight=1)
-        ttk.Label(sample_box, text="Samples").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        tk.Spinbox(sample_box, from_=1, to=MAX_SAMPLES, textvariable=self.offset_samples_var, width=8).grid(
-            row=0, column=1, sticky="w"
-        )
-        ttk.Button(sample_box, text="Measure offset", command=self.measure_offset).grid(
-            row=0, column=2, sticky="e", padx=(8, 0)
-        )
-
-        extended_box = ttk.Labelframe(panel, text="Extended timestamp", padding=10)
-        extended_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        extended_box.columnconfigure(1, weight=1)
-        ttk.Label(extended_box, text="Samples").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        tk.Spinbox(extended_box, from_=1, to=MAX_SAMPLES, textvariable=self.extended_samples_var, width=8).grid(
-            row=0, column=1, sticky="w"
-        )
-        ttk.Button(extended_box, text="Read extended time", command=self.read_extended).grid(
-            row=0, column=2, sticky="e", padx=(8, 0)
-        )
-
-    def _build_pps_input_page(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.grid(row=0, column=0, sticky="new")
-        panel.columnconfigure(1, weight=1)
-        self._build_pin_channel_fields(panel, row=0)
-
-        ttk.Label(panel, text="Event count").grid(row=2, column=0, sticky="w", pady=(10, 0), padx=(0, 8))
-        tk.Spinbox(panel, from_=-1, to=1000000, textvariable=self.event_count_var, width=10).grid(
-            row=2, column=1, sticky="w", pady=(10, 0)
-        )
-
-        actions = ttk.Frame(panel)
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        for column in range(3):
-            actions.columnconfigure(column, weight=1)
-        ttk.Button(actions, text="Set pin as input", command=self.configure_pps_input).grid(
-            row=0, column=0, sticky="ew", padx=(0, 8)
-        )
-        ttk.Button(actions, text="Read events", command=self.read_events).grid(
-            row=0, column=1, sticky="ew", padx=(0, 8)
-        )
-        ttk.Button(actions, text="Read until stopped", command=lambda: self.run_with_index(["-e", "-1"])).grid(
-            row=0, column=2, sticky="ew"
-        )
-
-    def _build_pps_output_page(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.grid(row=0, column=0, sticky="new")
-        panel.columnconfigure(1, weight=1)
-        self._build_pin_channel_fields(panel, row=0)
-
-        ttk.Label(panel, text="Preset").grid(row=2, column=0, sticky="w", pady=(10, 0), padx=(0, 8))
-        preset = ttk.Combobox(
-            panel,
-            textvariable=self.period_preset_var,
-            values=list(PERIOD_PRESETS.keys()),
-            state="readonly",
-            width=16,
-        )
-        preset.grid(row=2, column=1, sticky="w", pady=(10, 0))
-        preset.bind("<<ComboboxSelected>>", self._on_period_preset)
-
-        ttk.Label(panel, text="Period ns").grid(row=3, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
-        ttk.Entry(panel, textvariable=self.perout_period_var).grid(row=3, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(panel, text="Pulse width ns").grid(row=4, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
-        ttk.Entry(panel, textvariable=self.perout_width_var).grid(row=4, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(panel, text="Phase ns").grid(row=5, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
-        ttk.Entry(panel, textvariable=self.perout_phase_var).grid(row=5, column=1, sticky="ew", pady=(8, 0))
-
-        actions = ttk.Frame(panel)
-        actions.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        for column in range(3):
-            actions.columnconfigure(column, weight=1)
-        ttk.Button(actions, text="Set pin as output", command=self.configure_pps_output_pin).grid(
-            row=0, column=0, sticky="ew", padx=(0, 8)
-        )
-        ttk.Button(actions, text="Apply output", command=self.enable_perout).grid(
-            row=0, column=1, sticky="ew", padx=(0, 8)
-        )
-        ttk.Button(actions, text="Set pin and apply", command=lambda: self.enable_perout(configure_pin=True)).grid(
-            row=0, column=2, sticky="ew"
-        )
-        ttk.Button(actions, text="Disable output", command=self.disable_perout).grid(
-            row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0)
-        )
-
-    def _build_pins_page(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.grid(row=0, column=0, sticky="new")
-        panel.columnconfigure(1, weight=1)
-        self._build_pin_channel_fields(panel, row=0)
-
-        ttk.Label(panel, text="Function").grid(row=2, column=0, sticky="w", pady=(10, 0), padx=(0, 8))
-        ttk.Combobox(
-            panel,
-            textvariable=self.pin_function_var,
-            values=list(PIN_FUNCTIONS.keys()),
-            state="readonly",
-        ).grid(row=2, column=1, sticky="ew", pady=(10, 0))
-
-        actions = ttk.Frame(panel)
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        for column in range(2):
-            actions.columnconfigure(column, weight=1)
-        ttk.Button(actions, text="Apply pin function", command=self.set_pin_function).grid(
-            row=0, column=0, sticky="ew", padx=(0, 8)
-        )
-        ttk.Button(actions, text="List pins", command=lambda: self.run(["-l"])).grid(row=0, column=1, sticky="ew")
-
-    def _build_time_page(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.grid(row=0, column=0, sticky="new")
-        panel.columnconfigure(1, weight=1)
-
-        ttk.Button(panel, text="Get PTP clock time", command=lambda: self.run(["-g"])).grid(
-            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8)
-        )
-        ttk.Button(panel, text="Set PTP from system time", command=lambda: self.run(["-s"])).grid(
-            row=1, column=0, sticky="ew", padx=(0, 8), pady=(0, 8)
-        )
-        ttk.Button(panel, text="Set system from PTP time", command=lambda: self.run(["-S"])).grid(
-            row=1, column=1, sticky="ew", pady=(0, 8)
-        )
-
-        self._entry_row(panel, 2, "Frequency adjust ppb", self.freq_adjust_var)
-        ttk.Button(panel, text="Apply frequency adjustment", command=self.adjust_frequency).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(6, 10)
-        )
-
-        self._entry_row(panel, 4, "Shift seconds", self.shift_seconds_var)
-        self._entry_row(panel, 5, "Shift nanoseconds", self.shift_ns_var)
-        ttk.Button(panel, text="Shift PTP time", command=self.shift_time).grid(
-            row=6, column=0, columnspan=2, sticky="ew", pady=(6, 10)
-        )
-
-        self._entry_row(panel, 7, "Phase offset ns", self.phase_offset_var)
-        ttk.Button(panel, text="Apply phase offset", command=self.adjust_phase).grid(
-            row=8, column=0, columnspan=2, sticky="ew", pady=(6, 10)
-        )
-
-        self._entry_row(panel, 9, "Set PTP seconds", self.set_seconds_var)
-        ttk.Button(panel, text="Set PTP to seconds", command=self.set_time_seconds).grid(
-            row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0)
-        )
-
-    def _build_advanced_page(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.grid(row=0, column=0, sticky="new")
-        panel.columnconfigure(1, weight=1)
-
-        ttk.Button(panel, text="Flag test", command=lambda: self.run_with_index(["-z"])).grid(
-            row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8)
-        )
-        ttk.Button(panel, text="Enable system PPS", command=lambda: self.run(["-P", "1"])).grid(
-            row=0, column=1, sticky="ew", pady=(0, 8)
-        )
-        ttk.Button(panel, text="Disable system PPS", command=lambda: self.run(["-P", "0"])).grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8)
-        )
-
-        self._entry_row(panel, 2, "Debug mask channel", self.mask_channel_var)
-        ttk.Button(panel, text="Enable single mask channel", command=self.enable_mask_channel).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(6, 12)
-        )
-
-        ttk.Label(panel, text="Raw args").grid(row=4, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(panel, textvariable=self.raw_args_var).grid(row=4, column=1, sticky="ew")
-        ttk.Button(panel, text="Run raw args", command=self.run_raw_args).grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0)
-        )
-
-    def _build_context_fields(self, parent: ttk.Frame, row: int, columnspan: int) -> None:
-        box = ttk.Labelframe(parent, text="Context", padding=10)
-        box.grid(row=row, column=0, columnspan=columnspan, sticky="ew")
-        box.columnconfigure(1, weight=1)
-        self._pin_channel_fields(box, row=0)
-
-    def _build_pin_channel_fields(self, parent: ttk.Frame, row: int) -> None:
-        box = ttk.Labelframe(parent, text="Pin and channel", padding=10)
-        box.grid(row=row, column=0, columnspan=2, sticky="ew")
-        box.columnconfigure(1, weight=1)
-        self._pin_channel_fields(box, row=0)
-
-    def _pin_channel_fields(self, parent: ttk.Frame, row: int) -> None:
-        ttk.Label(parent, text="Pin").grid(row=row, column=0, sticky="w", padx=(0, 8))
-        tk.Spinbox(parent, from_=0, to=MAX_UI_INDEX, textvariable=self.pin_index_var, width=10).grid(
-            row=row, column=1, sticky="w"
-        )
-        ttk.Label(parent, text="Channel").grid(row=row + 1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
-        tk.Spinbox(parent, from_=0, to=MAX_UI_INDEX, textvariable=self.index_var, width=10).grid(
-            row=row + 1, column=1, sticky="w", pady=(8, 0)
-        )
-
-    def _entry_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(6, 0), padx=(0, 8))
-        ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=(6, 0))
-
-    def refresh_devices(self) -> None:
-        devices = ptp_devices()
-        self.device_box.configure(values=devices)
-        if self.device_var.get() not in devices:
-            self.device_var.set(devices[0])
-
-    def clear_output(self) -> None:
-        self.output.delete("1.0", "end")
-
-    def append_output(self, text: str) -> None:
-        self.output.insert("end", text)
-        self.output.see("end")
-
-    def parse_int(self, value: str, name: str, minimum: int, maximum: int) -> int:
-        try:
-            parsed = int(value, 0)
-        except ValueError as exc:
-            raise ValueError(f"{name} must be an integer") from exc
-        if parsed < minimum or parsed > maximum:
-            raise ValueError(f"{name} must be between {minimum} and {maximum}")
-        return parsed
-
-    def build_base_command(self) -> List[str]:
-        command_text = self.command_var.get().strip()
-        if not command_text:
-            raise ValueError("Command is required")
-        command = shlex.split(command_text)
-        device = self.device_var.get().strip()
-        if device:
-            command.extend(["-d", device])
-        return command
-
-    def selected_index(self) -> int:
-        return self.parse_int(self.index_var.get(), "Channel", 0, MAX_UI_INDEX)
-
-    def selected_pin(self) -> int:
-        return self.parse_int(self.pin_index_var.get(), "Pin", 0, MAX_UI_INDEX)
-
-    def run_with_index(self, args: List[str]) -> None:
-        try:
-            index = self.selected_index()
-        except ValueError as exc:
-            messagebox.showerror("Invalid channel", str(exc))
+    def invoke_selected(self) -> None:
+        actions = self.current_actions()
+        if not actions:
             return
-        self.run(["-i", str(index)] + args)
+        self.action_index = min(self.action_index, len(actions) - 1)
+        label, action = actions[self.action_index]
+        try:
+            self.status = label
+            action()
+        except ValueError as exc:
+            self.status = str(exc)
 
-    def run(self, args: List[str]) -> None:
-        if self.current_process and self.current_process.poll() is None:
-            messagebox.showwarning("Command running", "Stop the current command before starting another one.")
+    def draw(self) -> None:
+        self.stdscr.erase()
+        height, width = self.stdscr.getmaxyx()
+        if height < 14 or width < 60:
+            self.addstr(0, 0, "Terminal too small for ppstool TUI")
+            self.addstr(1, 0, "Resize to at least 60x14, or press q.")
+            self.stdscr.refresh()
             return
 
-        try:
-            command = self.build_base_command() + args
-        except ValueError as exc:
-            messagebox.showerror("Invalid command", str(exc))
-            return
+        self.draw_header(width)
+        nav_width = min(22, max(16, width // 5))
+        output_top = max(9, height // 2)
+        self.draw_nav(2, 0, output_top - 2, nav_width)
+        self.draw_actions(2, nav_width, output_top - 2, width - nav_width)
+        self.draw_output(output_top, 0, height - output_top - 2, width)
+        self.draw_footer(height - 2, width)
+        self.draw_status(height - 1, width)
+        self.stdscr.refresh()
 
+    def draw_header(self, width: int) -> None:
+        running = "running" if self.is_running() else "idle"
+        header = f" ppstool TUI [{running}] "
+        self.addstr(0, 0, header.ljust(width), self.color(1) | curses.A_BOLD)
+        context = f"Device {self.device} | Pin {self.pin} | Channel {self.channel}"
+        self.addstr(1, 1, context[: width - 2], self.color(2))
+
+    def draw_nav(self, top: int, left: int, height: int, width: int) -> None:
+        self.box(top, left, height, width, " Sections ")
+        for index, (title, _) in enumerate(self.sections):
+            attr = self.color(1) | curses.A_BOLD if index == self.section_index else 0
+            self.addstr(top + 1 + index, left + 2, title[: width - 4].ljust(width - 4), attr)
+
+    def draw_actions(self, top: int, left: int, height: int, width: int) -> None:
+        title = f" {self.sections[self.section_index][0]} "
+        self.box(top, left, height, width, title)
+        actions = self.current_actions()
+        self.action_index = min(self.action_index, max(0, len(actions) - 1))
+        for index, (label, _) in enumerate(actions[: max(0, height - 2)]):
+            attr = self.color(1) | curses.A_BOLD if index == self.action_index else 0
+            marker = ">" if index == self.action_index else " "
+            self.addstr(top + 1 + index, left + 2, f"{marker} {label}"[: width - 4].ljust(width - 4), attr)
+
+        detail_top = top + len(actions) + 2
+        if detail_top < top + height - 1:
+            self.addstr(detail_top, left + 2, f"Command: {self.command_text}"[: width - 4], self.color(2))
+
+    def draw_output(self, top: int, left: int, height: int, width: int) -> None:
+        self.box(top, left, height, width, " Output ")
+        visible_height = max(0, height - 2)
+        lines = self.output_lines[:-1] if self.output_lines[-1] == "" else self.output_lines
+        start = max(0, len(lines) - visible_height - self.output_scroll)
+        stop = max(0, len(lines) - self.output_scroll)
+        visible = lines[start:stop]
+        for row, line in enumerate(visible[:visible_height]):
+            self.addstr(top + 1 + row, left + 2, line[: width - 4])
+
+    def draw_footer(self, y: int, width: int) -> None:
+        help_text = "Arrows/hjkl move | Enter run/edit | s settings | x stop | c clear | PgUp/PgDn output | q quit"
+        self.addstr(y, 0, help_text[:width].ljust(width), self.color(3))
+
+    def draw_status(self, y: int, width: int) -> None:
+        self.addstr(y, 0, self.status[:width].ljust(width), self.color(4 if not self.is_running() else 3))
+
+    def box(self, top: int, left: int, height: int, width: int, title: str = "") -> None:
+        if height <= 1 or width <= 1:
+            return
+        window = self.stdscr.derwin(height, width, top, left)
+        window.box()
+        if title:
+            window.addstr(0, 2, title[: max(0, width - 4)])
+
+    def addstr(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        height, width = self.stdscr.getmaxyx()
+        if y < 0 or y >= height or x < 0 or x >= width:
+            return
+        try:
+            self.stdscr.addstr(y, x, text[: width - x], attr)
+        except curses.error:
+            pass
+
+    def prompt(self, label: str, current: str = "") -> str:
+        height, width = self.stdscr.getmaxyx()
+        prompt = f"{label}"
+        if current:
+            prompt += f" [{current}]"
+        prompt += ": "
+        y = height - 1
+        self.stdscr.timeout(-1)
+        curses.echo()
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        self.addstr(y, 0, " " * width)
+        self.addstr(y, 0, prompt[: width - 1], self.color(3))
+        self.stdscr.refresh()
+        try:
+            raw = self.stdscr.getstr(y, min(len(prompt), width - 1), max(1, width - len(prompt) - 1))
+            value = raw.decode("utf-8", errors="replace").strip()
+        finally:
+            curses.noecho()
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            self.stdscr.timeout(100)
+        return current if value == "" else value
+
+    def prompt_int(self, label: str, current: int, minimum: int, maximum: int) -> int:
+        value = self.prompt(label, str(current))
+        return parse_int(value, label, minimum, maximum)
+
+    def base_command(self) -> List[str]:
+        return build_base_command(self.command_text, self.device)
+
+    def is_running(self) -> bool:
+        return self.current_process is not None and self.current_process.poll() is None
+
+    def run_command(self, args: List[str]) -> None:
+        if self.is_running():
+            self.status = "A command is already running. Press x to stop it."
+            return
+        command = self.base_command() + args
         self.append_output(f"$ {command_to_text(command)}\n")
-        self.set_running(True)
-        thread = threading.Thread(target=self._run_worker, args=(command,), daemon=True)
+        self.status = "Running command"
+        thread = threading.Thread(target=self.run_worker, args=(command,), daemon=True)
         thread.start()
 
-    def _run_worker(self, command: List[str]) -> None:
+    def run_worker(self, command: List[str]) -> None:
         try:
             process = subprocess.Popen(
                 command,
@@ -612,8 +378,7 @@ class PpsToolGui(tk.Tk):
             assert process.stdout is not None
             for line in process.stdout:
                 self.output_queue.put(("line", line))
-            return_code = process.wait()
-            self.output_queue.put(("done", return_code))
+            self.output_queue.put(("done", process.wait()))
         except FileNotFoundError:
             self.output_queue.put(("line", f"Command not found: {command[0]}\n"))
             self.output_queue.put(("done", 127))
@@ -621,7 +386,7 @@ class PpsToolGui(tk.Tk):
             self.output_queue.put(("line", f"{exc}\n"))
             self.output_queue.put(("done", 1))
 
-    def _drain_output(self) -> None:
+    def drain_output(self) -> None:
         try:
             while True:
                 kind, payload = self.output_queue.get_nowait()
@@ -629,389 +394,130 @@ class PpsToolGui(tk.Tk):
                     self.append_output(str(payload))
                 elif kind == "done":
                     self.current_process = None
-                    self.set_running(False)
                     self.append_output(f"\n[exit {payload}]\n\n")
+                    self.status = f"Command exited {payload}"
         except queue.Empty:
             pass
-        self.after(100, self._drain_output)
 
-    def set_running(self, running: bool) -> None:
-        self.stop_button.configure(state="normal" if running else "disabled")
+    def append_output(self, text: str) -> None:
+        for part in text.splitlines(True):
+            if part.endswith("\n"):
+                self.output_lines[-1] += part[:-1]
+                self.output_lines.append("")
+            else:
+                self.output_lines[-1] += part
+        if len(self.output_lines) > MAX_OUTPUT_LINES:
+            self.output_lines = self.output_lines[-MAX_OUTPUT_LINES:]
+        self.output_scroll = 0
 
     def stop_command(self) -> None:
         process = self.current_process
         if process and process.poll() is None:
             self.append_output("\n[terminating]\n")
             process.terminate()
-
-    def _on_period_preset(self, _event: tk.Event) -> None:
-        value = PERIOD_PRESETS[self.period_preset_var.get()]
-        if value:
-            self.perout_period_var.set(value)
-
-    def measure_offset(self) -> None:
-        try:
-            samples = self.parse_int(self.offset_samples_var.get(), "Offset samples", 1, MAX_SAMPLES)
-        except ValueError as exc:
-            messagebox.showerror("Invalid samples", str(exc))
-            return
-        self.run(["-k", str(samples)])
-
-    def read_extended(self) -> None:
-        try:
-            samples = self.parse_int(self.extended_samples_var.get(), "Extended samples", 1, MAX_SAMPLES)
-        except ValueError as exc:
-            messagebox.showerror("Invalid samples", str(exc))
-            return
-        self.run(["-x", str(samples)])
-
-    def configure_pps_input(self) -> None:
-        try:
-            index = self.selected_index()
-            pin = self.selected_pin()
-        except ValueError as exc:
-            messagebox.showerror("Invalid PPS input", str(exc))
-            return
-        self.run(["-i", str(index), "-L", f"{pin},{PIN_FUNCTIONS['External timestamp']}"])
-
-    def configure_pps_output_pin(self) -> None:
-        try:
-            index = self.selected_index()
-            pin = self.selected_pin()
-        except ValueError as exc:
-            messagebox.showerror("Invalid PPS output", str(exc))
-            return
-        self.run(["-i", str(index), "-L", f"{pin},{PIN_FUNCTIONS['Periodic output']}"])
-
-    def configure_one_hz_output(self) -> None:
-        self.period_preset_var.set("1 Hz")
-        self.perout_period_var.set(PERIOD_PRESETS["1 Hz"])
-        self.enable_perout(configure_pin=True)
-
-    def set_pin_function(self) -> None:
-        try:
-            index = self.selected_index()
-            pin = self.selected_pin()
-        except ValueError as exc:
-            messagebox.showerror("Invalid pin", str(exc))
-            return
-        function = PIN_FUNCTIONS[self.pin_function_var.get()]
-        self.run(["-i", str(index), "-L", f"{pin},{function}"])
-
-    def enable_perout(self, configure_pin: bool = False) -> None:
-        try:
-            index = self.selected_index()
-            pin = self.selected_pin()
-            period = self.parse_int(self.perout_period_var.get(), "Period", 0, 2**63 - 1)
-            width_text = self.perout_width_var.get().strip()
-            phase_text = self.perout_phase_var.get().strip()
-            width = None if not width_text else self.parse_int(width_text, "Pulse width", 0, 2**63 - 1)
-            phase = None if not phase_text else self.parse_int(phase_text, "Phase", 0, 2**63 - 1)
-        except ValueError as exc:
-            messagebox.showerror("Invalid output", str(exc))
-            return
-
-        args = ["-i", str(index)]
-        if configure_pin:
-            args.extend(["-L", f"{pin},{PIN_FUNCTIONS['Periodic output']}"])
-        args.extend(["-p", str(period)])
-        if width is not None:
-            args.extend(["-w", str(width)])
-        if phase is not None:
-            args.extend(["-H", str(phase)])
-        self.run(args)
-
-    def disable_perout(self) -> None:
-        try:
-            index = self.selected_index()
-        except ValueError as exc:
-            messagebox.showerror("Invalid output", str(exc))
-            return
-        self.run(["-i", str(index), "-p", "0"])
-
-    def read_events(self) -> None:
-        try:
-            count = self.parse_int(self.event_count_var.get(), "Event count", -1, 1000000)
-        except ValueError as exc:
-            messagebox.showerror("Invalid event count", str(exc))
-            return
-        self.run_with_index(["-e", str(count)])
-
-    def adjust_frequency(self) -> None:
-        try:
-            value = self.parse_int(self.freq_adjust_var.get(), "Frequency adjustment", -(2**31), 2**31 - 1)
-        except ValueError as exc:
-            messagebox.showerror("Invalid frequency", str(exc))
-            return
-        self.run(["-f", str(value)])
-
-    def shift_time(self) -> None:
-        try:
-            seconds = self.parse_int(self.shift_seconds_var.get(), "Shift seconds", -(2**31), 2**31 - 1)
-            nanoseconds = self.parse_int(self.shift_ns_var.get(), "Shift nanoseconds", -(2**31), 2**31 - 1)
-        except ValueError as exc:
-            messagebox.showerror("Invalid time shift", str(exc))
-            return
-        self.run(["-t", str(seconds), "-n", str(nanoseconds)])
-
-    def adjust_phase(self) -> None:
-        try:
-            value = self.parse_int(self.phase_offset_var.get(), "Phase offset", -(2**31), 2**31 - 1)
-        except ValueError as exc:
-            messagebox.showerror("Invalid phase", str(exc))
-            return
-        self.run(["-o", str(value)])
-
-    def set_time_seconds(self) -> None:
-        try:
-            value = self.parse_int(self.set_seconds_var.get(), "PTP seconds", 0, 2**31 - 1)
-        except ValueError as exc:
-            messagebox.showerror("Invalid time", str(exc))
-            return
-        self.run(["-T", str(value)])
-
-    def enable_mask_channel(self) -> None:
-        try:
-            value = self.parse_int(self.mask_channel_var.get(), "Mask channel", 0, MAX_UI_INDEX)
-        except ValueError as exc:
-            messagebox.showerror("Invalid mask channel", str(exc))
-            return
-        self.run(["-F", str(value)])
-
-    def run_raw_args(self) -> None:
-        raw_args = self.raw_args_var.get().strip()
-        if not raw_args:
-            messagebox.showerror("Invalid arguments", "Raw args are required")
-            return
-        try:
-            args = shlex.split(raw_args)
-        except ValueError as exc:
-            messagebox.showerror("Invalid arguments", str(exc))
-            return
-        self.run(args)
-
-
-class TextPpsToolUi:
-    def __init__(self) -> None:
-        self.command_text = default_command()
-        self.device = ptp_devices()[0]
-        self.channel = 0
-        self.pin = 0
-
-    def run(self) -> int:
-        print("ppstool text UI")
-        print("Press Ctrl-C while a command is running to stop it.\n")
-        while True:
-            try:
-                choice = self.choose(
-                    "Main menu",
-                    [
-                        ("Common setup", self.common_setup),
-                        ("Status", self.status),
-                        ("PPS input", self.pps_input),
-                        ("PPS output", self.pps_output),
-                        ("Pins", self.pins),
-                        ("Time", self.time),
-                        ("Advanced", self.advanced),
-                        ("Settings", self.settings),
-                    ],
-                )
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return 0
-            if choice == "quit":
-                return 0
-
-    def choose(self, title: str, items: List[Tuple[str, Callable[[], None]]]) -> str:
-        while True:
-            print(f"\n== {title} ==")
-            print(f"Command: {self.command_text}")
-            print(f"Device:  {self.device}    Pin: {self.pin}    Channel: {self.channel}")
-            for index, (label, _) in enumerate(items, start=1):
-                print(f"{index}. {label}")
-            print("q. Back" if title != "Main menu" else "q. Quit")
-            choice = input("> ").strip().lower()
-            if choice in {"q", "quit", "b", "back"}:
-                return "quit" if title == "Main menu" else "back"
-            if not choice:
-                continue
-            try:
-                label, action = items[int(choice) - 1]
-            except (ValueError, IndexError):
-                print("Invalid selection")
-                continue
-            print(f"\n-- {label} --")
-            try:
-                action()
-            except ValueError as exc:
-                print(f"Error: {exc}")
-            input("\nPress Enter to continue...")
-
-    def prompt(self, label: str, current: str = "") -> str:
-        suffix = f" [{current}]" if current != "" else ""
-        value = input(f"{label}{suffix}: ").strip()
-        return current if value == "" else value
-
-    def prompt_int(self, label: str, current: int, minimum: int, maximum: int) -> int:
-        value = self.prompt(label, str(current))
-        return parse_int(value, label, minimum, maximum)
-
-    def base_command(self) -> List[str]:
-        return build_base_command(self.command_text, self.device)
-
-    def run_command(self, args: List[str]) -> None:
-        command = self.base_command() + args
-        print(f"$ {command_to_text(command)}")
-        try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-        except FileNotFoundError:
-            print(f"Command not found: {command[0]}")
-            return
-        except OSError as exc:
-            print(exc)
-            return
-
-        try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                print(line, end="")
-            return_code = process.wait()
-        except KeyboardInterrupt:
-            print("\n[terminating]")
-            process.terminate()
-            try:
-                return_code = process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                return_code = process.wait()
-        print(f"\n[exit {return_code}]")
+            self.status = "Terminating command"
 
     def run_with_index(self, args: List[str]) -> None:
         self.run_command(["-i", str(self.channel)] + args)
 
-    def common_setup(self) -> None:
-        self.choose(
-            "Common setup",
-            [
-                ("Inspect device", lambda: self.run_command(["-c", "-l"])),
-                ("Configure PPS input", self.configure_pps_input),
-                ("Configure 1 Hz PPS output", self.configure_one_hz_output),
-                ("Read PPS input until stopped", lambda: self.run_with_index(["-e", "-1"])),
-                ("Enable system PPS", lambda: self.run_command(["-P", "1"])),
-                ("Disable periodic output", self.disable_perout),
-            ],
-        )
+    def common_actions(self) -> List[Action]:
+        return [
+            ("Inspect device", lambda: self.run_command(["-c", "-l"])),
+            ("Configure PPS input", self.configure_pps_input),
+            ("Configure 1 Hz PPS output", self.configure_one_hz_output),
+            ("Read PPS input until stopped", lambda: self.run_with_index(["-e", "-1"])),
+            ("Enable system PPS", lambda: self.run_command(["-P", "1"])),
+            ("Disable periodic output", self.disable_perout),
+        ]
 
-    def status(self) -> None:
-        self.choose(
-            "Status",
-            [
-                ("Capabilities", lambda: self.run_command(["-c"])),
-                ("Pin configuration", lambda: self.run_command(["-l"])),
-                ("Clock time", lambda: self.run_command(["-g"])),
-                ("Cross timestamp", lambda: self.run_command(["-X"])),
-                ("Measure offset", self.measure_offset),
-                ("Read extended time", self.read_extended),
-            ],
-        )
+    def status_actions(self) -> List[Action]:
+        return [
+            ("Capabilities", lambda: self.run_command(["-c"])),
+            ("Pin configuration", lambda: self.run_command(["-l"])),
+            ("Clock time", lambda: self.run_command(["-g"])),
+            ("Cross timestamp", lambda: self.run_command(["-X"])),
+            ("Measure offset", self.measure_offset),
+            ("Read extended time", self.read_extended),
+        ]
 
-    def pps_input(self) -> None:
-        self.choose(
-            "PPS input",
-            [
-                ("Set pin as input", self.configure_pps_input),
-                ("Read events", self.read_events),
-                ("Read until stopped", lambda: self.run_with_index(["-e", "-1"])),
-            ],
-        )
+    def pps_input_actions(self) -> List[Action]:
+        return [
+            ("Set pin as input", self.configure_pps_input),
+            ("Read events", self.read_events),
+            ("Read until stopped", lambda: self.run_with_index(["-e", "-1"])),
+        ]
 
-    def pps_output(self) -> None:
-        self.choose(
-            "PPS output",
-            [
-                ("Set pin as output", self.configure_pps_output_pin),
-                ("Apply output", self.enable_perout),
-                ("Set pin and apply", lambda: self.enable_perout(configure_pin=True)),
-                ("Disable output", self.disable_perout),
-            ],
-        )
+    def pps_output_actions(self) -> List[Action]:
+        return [
+            ("Set pin as output", self.configure_pps_output_pin),
+            ("Apply output", self.enable_perout),
+            ("Set pin and apply", lambda: self.enable_perout(configure_pin=True)),
+            ("Disable output", self.disable_perout),
+        ]
 
-    def pins(self) -> None:
-        self.choose(
-            "Pins",
-            [
-                ("Apply pin function", self.set_pin_function),
-                ("List pins", lambda: self.run_command(["-l"])),
-            ],
-        )
+    def pin_actions(self) -> List[Action]:
+        return [
+            ("Apply pin function", self.set_pin_function),
+            ("List pins", lambda: self.run_command(["-l"])),
+        ]
 
-    def time(self) -> None:
-        self.choose(
-            "Time",
-            [
-                ("Get PTP clock time", lambda: self.run_command(["-g"])),
-                ("Set PTP from system time", lambda: self.run_command(["-s"])),
-                ("Set system from PTP time", lambda: self.run_command(["-S"])),
-                ("Apply frequency adjustment", self.adjust_frequency),
-                ("Shift PTP time", self.shift_time),
-                ("Apply phase offset", self.adjust_phase),
-                ("Set PTP to seconds", self.set_time_seconds),
-            ],
-        )
+    def time_actions(self) -> List[Action]:
+        return [
+            ("Get PTP clock time", lambda: self.run_command(["-g"])),
+            ("Set PTP from system time", lambda: self.run_command(["-s"])),
+            ("Set system from PTP time", lambda: self.run_command(["-S"])),
+            ("Apply frequency adjustment", self.adjust_frequency),
+            ("Shift PTP time", self.shift_time),
+            ("Apply phase offset", self.adjust_phase),
+            ("Set PTP to seconds", self.set_time_seconds),
+        ]
 
-    def advanced(self) -> None:
-        self.choose(
-            "Advanced",
-            [
-                ("Flag test", lambda: self.run_with_index(["-z"])),
-                ("Enable system PPS", lambda: self.run_command(["-P", "1"])),
-                ("Disable system PPS", lambda: self.run_command(["-P", "0"])),
-                ("Enable single mask channel", self.enable_mask_channel),
-                ("Run raw args", self.run_raw_args),
-            ],
-        )
+    def advanced_actions(self) -> List[Action]:
+        return [
+            ("Flag test", lambda: self.run_with_index(["-z"])),
+            ("Enable system PPS", lambda: self.run_command(["-P", "1"])),
+            ("Disable system PPS", lambda: self.run_command(["-P", "0"])),
+            ("Enable single mask channel", self.enable_mask_channel),
+            ("Run raw args", self.run_raw_args),
+        ]
 
-    def settings(self) -> None:
-        while True:
-            print("\n== Settings ==")
-            print(f"1. Command: {self.command_text}")
-            print(f"2. Device:  {self.device}")
-            print(f"3. Pin:     {self.pin}")
-            print(f"4. Channel: {self.channel}")
-            print("q. Back")
-            choice = input("> ").strip().lower()
-            if choice in {"q", "quit", "b", "back"}:
-                return
-            if choice == "1":
-                self.command_text = self.prompt("Command", self.command_text)
-            elif choice == "2":
-                self.select_device()
-            elif choice == "3":
-                self.pin = self.prompt_int("Pin", self.pin, 0, MAX_UI_INDEX)
-            elif choice == "4":
-                self.channel = self.prompt_int("Channel", self.channel, 0, MAX_UI_INDEX)
-            else:
-                print("Invalid selection")
+    def settings_actions(self) -> List[Action]:
+        return [
+            ("Edit command", self.edit_command),
+            ("Select device", self.select_device),
+            ("Edit pin", self.edit_pin),
+            ("Edit channel", self.edit_channel),
+            ("Refresh devices", self.refresh_devices),
+        ]
+
+    def edit_command(self) -> None:
+        self.command_text = self.prompt("Command", self.command_text)
+        self.status = "Command updated"
 
     def select_device(self) -> None:
         devices = ptp_devices()
-        print("\nAvailable devices:")
-        for index, device in enumerate(devices, start=1):
-            print(f"{index}. {device}")
-        print("Or enter a device path.")
-        value = self.prompt("Device", self.device)
+        options = ", ".join(f"{index + 1}={device}" for index, device in enumerate(devices))
+        self.status = f"Devices: {options}"
+        value = self.prompt("Device number/path", self.device)
         try:
             self.device = devices[int(value) - 1]
         except (ValueError, IndexError):
             self.device = value
+        self.status = "Device updated"
+
+    def edit_pin(self) -> None:
+        self.pin = self.prompt_int("Pin", self.pin, 0, MAX_UI_INDEX)
+        self.status = "Pin updated"
+
+    def edit_channel(self) -> None:
+        self.channel = self.prompt_int("Channel", self.channel, 0, MAX_UI_INDEX)
+        self.status = "Channel updated"
+
+    def refresh_devices(self) -> None:
+        devices = ptp_devices()
+        if self.device not in devices:
+            self.device = devices[0]
+        self.status = f"Devices refreshed: {', '.join(devices)}"
 
     def measure_offset(self) -> None:
         samples = self.prompt_int("Samples", 5, 1, MAX_SAMPLES)
@@ -1032,9 +538,9 @@ class TextPpsToolUi:
 
     def set_pin_function(self) -> None:
         names = list(PIN_FUNCTIONS.keys())
-        for index, name in enumerate(names, start=1):
-            print(f"{index}. {name}")
-        value = self.prompt("Function", "External timestamp")
+        options = ", ".join(f"{index + 1}={name}" for index, name in enumerate(names))
+        self.status = f"Functions: {options}"
+        value = self.prompt("Function number/name", "External timestamp")
         try:
             function_name = names[int(value) - 1]
         except (ValueError, IndexError):
@@ -1044,10 +550,7 @@ class TextPpsToolUi:
         self.run_command(["-i", str(self.channel), "-L", f"{self.pin},{PIN_FUNCTIONS[function_name]}"])
 
     def enable_perout(self, configure_pin: bool = False, preset_period: str = "") -> None:
-        if preset_period:
-            period = parse_int(preset_period, "Period", 0, 2**63 - 1)
-        else:
-            period = self.prompt_period()
+        period = parse_int(preset_period, "Period", 0, 2**63 - 1) if preset_period else self.prompt_period()
         width_text = self.prompt("Pulse width ns (optional)", "")
         phase_text = self.prompt("Phase ns (optional)", "")
 
@@ -1063,10 +566,12 @@ class TextPpsToolUi:
 
     def prompt_period(self) -> int:
         presets = list(PERIOD_PRESETS.items())
-        for index, (label, value) in enumerate(presets, start=1):
-            suffix = f" ({value} ns)" if value else ""
-            print(f"{index}. {label}{suffix}")
-        value = self.prompt("Preset or period ns", "1")
+        options = ", ".join(
+            f"{index + 1}={label}{' ' + value + 'ns' if value else ''}"
+            for index, (label, value) in enumerate(presets)
+        )
+        self.status = f"Presets: {options}"
+        value = self.prompt("Preset number or period ns", "1")
         try:
             _, period = presets[int(value) - 1]
         except (ValueError, IndexError):
@@ -1110,16 +615,30 @@ class TextPpsToolUi:
         self.run_command(shlex.split(raw_args))
 
 
+class PlainFallback:
+    def run(self) -> int:
+        print("ppstool requires a terminal for the curses TUI.")
+        print("Run it from an interactive terminal, or pass --help for usage.")
+        return 1
+
+
+def run_curses() -> int:
+    if curses is None:
+        print("Python curses support is not available.", file=sys.stderr)
+        return 1
+    return curses.wrapper(lambda stdscr: PpsToolTui(stdscr).run())
+
+
 def main() -> int:
-    if "--tk" in sys.argv:
-        if not TK_AVAILABLE:
-            print("Tkinter is not available for this Python.", file=sys.stderr)
-            print("Run without --tk for the self-contained text UI.", file=sys.stderr)
-            return 1
-        app = PpsToolGui()
-        app.mainloop()
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("usage: ppstool-gui [--help]")
+        print()
+        print("Launches the ppstool terminal UI. Build with `make zipapp`")
+        print("to embed the ppstool CLI inside ppstool-gui.pyz.")
         return 0
-    return TextPpsToolUi().run()
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return PlainFallback().run()
+    return run_curses()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ GUI_APP := ppstool-gui.pyz
 ZIPAPP_DIR := .ppstool-gui-zipapp
 ZIPAPP_EMBED_CLI ?= 1
 
-.PHONY: all check clean gui install install-gui uninstall zipapp
+.PHONY: all check clean gui install install-gui install-ui ui uninstall zipapp
 
 all: $(TARGET)
 
@@ -23,6 +23,8 @@ $(TARGET): ppstool.c ptp_clock.h
 
 gui:
 	python3 -m py_compile $(GUI)
+
+ui: gui
 
 zipapp: $(GUI_APP)
 
@@ -48,6 +50,8 @@ install: $(TARGET)
 install-gui: install $(GUI_APP)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(GUI_APP) $(DESTDIR)$(BINDIR)/ppstool-gui
+
+install-ui: install-gui
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
