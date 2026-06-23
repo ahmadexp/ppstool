@@ -47,6 +47,10 @@ make zipapp
 ./ppstool-gui.pyz
 ```
 
+The zipapp still uses the host Python runtime, so Tkinter must be installed for
+that Python. If `./ppstool-gui.pyz` reports that it cannot import `tkinter`,
+install the platform Tkinter package such as `python3-tk`.
+
 ## Install
 
 Install the CLI:

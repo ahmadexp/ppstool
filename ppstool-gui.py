@@ -10,10 +10,24 @@ import shlex
 import subprocess
 import sys
 import threading
-import tkinter as tk
-from tkinter import messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
 from typing import List, Optional, Tuple, Union
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+    from tkinter.scrolledtext import ScrolledText
+except ModuleNotFoundError as exc:
+    if exc.name and exc.name.startswith("tkinter"):
+        print(
+            "ppstool-gui requires Python Tkinter, but this Python cannot import tkinter.",
+            file=sys.stderr,
+        )
+        print("Install the Tkinter package for the Python used to run ppstool-gui.", file=sys.stderr)
+        print("Debian/Ubuntu: sudo apt install python3-tk", file=sys.stderr)
+        print("Fedora/RHEL:   sudo dnf install python3-tkinter", file=sys.stderr)
+        print("Arch:         sudo pacman -S tk", file=sys.stderr)
+        raise SystemExit(1) from None
+    raise
 
 
 DEFAULT_DEVICE = "/dev/ptp0"
