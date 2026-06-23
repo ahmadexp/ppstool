@@ -1,0 +1,4 @@
+ppstool
+ppstool-gui.pyz
+.ppstool-gui-zipapp/
+__pycache__/

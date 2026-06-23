@@ -40,6 +40,13 @@ Check the optional GUI syntax without building the C tool:
 make gui
 ```
 
+Build the optional GUI as a Python zipapp:
+
+```sh
+make zipapp
+./ppstool-gui.pyz
+```
+
 ## Install
 
 Install the CLI:
@@ -53,6 +60,8 @@ Install both the CLI and GUI:
 ```sh
 sudo make install-gui
 ```
+
+The GUI is installed from the generated zipapp as `ppstool-gui`.
 
 The default prefix is `/usr/local`. Override it when needed:
 

@@ -8,6 +8,7 @@ from pathlib import Path
 import queue
 import shlex
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -43,9 +44,13 @@ MENU_ITEMS = [
 
 
 def default_command() -> str:
-    local_binary = Path(__file__).resolve().with_name("ppstool")
-    if local_binary.exists():
-        return str(local_binary)
+    candidates = [
+        Path(sys.argv[0]).resolve().with_name("ppstool"),
+        Path(__file__).resolve().with_name("ppstool"),
+    ]
+    for local_binary in candidates:
+        if local_binary.exists():
+            return str(local_binary)
     return "ppstool"
 
 
